@@ -222,7 +222,7 @@ impl JIT {
             &[("opt_level", "speed")],
             cranelift_module::default_libcall_names(),
         )?);
-        eprintln!("*** JIT target ISA: {}", module.isa().triple());
+        log::info!("*** JIT target ISA: {}", module.isa().triple());
         Ok(Self {
             ctx: module.make_context(),
             builder_ctx: FunctionBuilderContext::new(),
@@ -675,7 +675,7 @@ extern "C" fn free(machine: *mut Machine, ix: u32) {
 }
 
 extern "C" fn trace(pc: u32) {
-    eprintln!("*** Trace: pc={pc:08x}");
+    log::info!("*** Trace: pc={pc:08x}");
 }
 
 impl Machine {
@@ -840,7 +840,7 @@ impl Machine {
             12 => {
                 let idx = self.regs[b] as usize;
                 if idx != 0 {
-                    eprintln!("*** LONGJMP to block: {idx} ***");
+                    log::info!("*** LONGJMP to block: {idx} ***");
                     self.mems[0] = self.mems[idx].clone();
                     self.counter = vec![0; self.mems[0].len()].into_boxed_slice();
                     self.compiled = vec![None; self.mems[0].len()];
