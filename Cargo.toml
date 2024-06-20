@@ -1,0 +1,13 @@
+[package]
+name = "umix-2024"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1.0.86"
+argopt = "0.3.0"
+cranelift = "0.108.1"
+cranelift-jit = "0.108.1"
+cranelift-module = "0.108.1"
+env_logger = "0.11.3"
+log = "0.4.21"
