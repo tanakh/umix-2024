@@ -6,10 +6,10 @@ use std::{
 
 use cranelift::prelude::*;
 use cranelift_jit::{JITBuilder, JITModule};
-use cranelift_module::Module as _;
+use cranelift_module::{Linkage, Module};
 use log::{log_enabled, Level};
 
-const MAX_BLOCKS: usize = 1 << 20;
+const MAX_BLOCKS: usize = 1 << 18;
 const CACHE_SIZE: usize = 32;
 const JIT_THRESHOLD: usize = 1024;
 
@@ -20,6 +20,7 @@ type CompiledFn = unsafe fn(
     regs: *mut u32,
     mems: *const Block,
     cb: *const Callbacks,
+    jitted: *const (),
 ) -> u32;
 
 #[repr(C)]
@@ -35,7 +36,8 @@ pub struct Machine {
     pc: usize,
     regs: [u32; 8],
     mems: Box<[Block]>,
-    free: Vec<usize>,
+    free: [Vec<usize>; CACHE_SIZE],
+    free_id: usize,
     allocator: Allocator,
 
     jit: JIT,
@@ -219,7 +221,11 @@ impl Analysis {
 impl JIT {
     fn new() -> anyhow::Result<Self> {
         let module = JITModule::new(JITBuilder::with_flags(
-            &[("opt_level", "speed")],
+            &[
+                ("opt_level", "speed"),
+                ("preserve_frame_pointers", "true"),
+                ("unwind_info", "false"),
+            ],
             cranelift_module::default_libcall_names(),
         )?);
         log::info!("*** JIT target ISA: {}", module.isa().triple());
@@ -244,6 +250,9 @@ impl JIT {
             return Ok(ptr);
         }
 
+        log::info!("*** JIT settings:");
+        log::info!("{}", self.module.isa().flags());
+
         if log_enabled!(Level::Info) {
             log::info!(
                 "*** JIT compiling block at pc={pc:08x}:{:08x} ({} insts)",
@@ -263,9 +272,17 @@ impl JIT {
             self.ctx.set_disasm(true);
         }
 
-        let id = self
-            .module
-            .declare_anonymous_function(&self.ctx.func.signature)?;
+        // let id = self
+        //     .module
+        //     .declare_anonymous_function(&self.ctx.func.signature)?;
+
+        self.ctx.func.signature.call_conv = isa::CallConv::Tail;
+
+        let id = self.module.declare_function(
+            &format!("{pc:08x}_{:08x}", pc as usize + code.len() - 1),
+            Linkage::Local,
+            &self.ctx.func.signature,
+        )?;
 
         self.module.define_function(id, &mut self.ctx)?;
 
@@ -300,6 +317,8 @@ impl JIT {
         params.push(AbiParam::new(pt));
         // cb
         params.push(AbiParam::new(pt));
+        // jitted
+        params.push(AbiParam::new(pt));
 
         self.ctx
             .func
@@ -319,6 +338,7 @@ impl JIT {
         let param_regs = builder.block_params(entry_block)[1];
         let param_mems = builder.block_params(entry_block)[2];
         let param_cb = builder.block_params(entry_block)[3];
+        let param_jitted = builder.block_params(entry_block)[4];
 
         let mf = MemFlags::new();
 
@@ -358,6 +378,18 @@ impl JIT {
         } else {
             None
         };
+
+        let cont_sig = builder.import_signature(Signature {
+            params: vec![
+                AbiParam::new(pt),
+                AbiParam::new(pt),
+                AbiParam::new(pt),
+                AbiParam::new(pt),
+                AbiParam::new(pt),
+            ],
+            returns: vec![AbiParam::new(types::I32)],
+            call_conv: isa::CallConv::Tail,
+        });
 
         let pt_size = self.module.target_config().pointer_bytes() as i32;
 
@@ -624,6 +656,7 @@ impl JIT {
                 // Load Program
                 12 => {
                     finalize!();
+
                     // if B == 0 then return C, otherwise return address of this instruction
                     let cur_pc = builder
                         .ins()
@@ -633,7 +666,45 @@ impl JIT {
                     let rc = regs[c].value(&mut builder, &mut const_cache);
 
                     let ret_addr = builder.ins().select(rb, cur_pc, rc);
-                    builder.ins().return_(&[ret_addr]);
+
+                    let offset = builder.ins().uextend(pt, ret_addr);
+                    let pt_size = builder.ins().iconst(types::I64, pt_size as i64);
+                    let offset = builder.ins().imul(offset, pt_size);
+                    let cont_addr = builder.ins().iadd(param_jitted, offset);
+                    let cont = builder.ins().load(pt, mf, cont_addr, 0);
+
+                    let call_jit = builder.create_block();
+                    {
+                        builder.append_block_param(call_jit, pt);
+                        builder.switch_to_block(call_jit);
+                        let param_cont = builder.block_params(call_jit)[0];
+                        builder.ins().return_call_indirect(
+                            cont_sig,
+                            param_cont,
+                            &[
+                                param_machine,
+                                param_regs,
+                                param_mems,
+                                param_cb,
+                                param_jitted,
+                            ],
+                        );
+                    }
+
+                    let ret_pc = builder.create_block();
+                    {
+                        builder.append_block_param(ret_pc, types::I32);
+                        builder.switch_to_block(ret_pc);
+                        builder.ins().return_(&[ret_addr]);
+                    }
+
+                    builder.switch_to_block(entry_block);
+                    builder
+                        .ins()
+                        .brif(cont, call_jit, &[cont], ret_pc, &[ret_addr]);
+
+                    builder.seal_block(call_jit);
+                    builder.seal_block(ret_pc);
                 }
                 // Orthography
                 13 => {
@@ -700,7 +771,8 @@ impl Machine {
             pc: 0,
             regs: [0; 8],
             mems,
-            free: (1..MAX_BLOCKS).rev().collect(),
+            free: Default::default(),
+            free_id: 1,
             allocator: Allocator::new(),
             counter,
             jit: JIT::new()?,
@@ -746,6 +818,7 @@ impl Machine {
                             self.regs.as_mut_ptr(),
                             self.mems.as_ptr(),
                             &self.callbacks,
+                            self.compiled.as_ptr() as *const _,
                         )
                     };
 
@@ -860,19 +933,30 @@ impl Machine {
         true
     }
 
-    #[inline(never)]
     fn alloc(&mut self, size: u32) -> u32 {
-        let ix = self.free.pop().expect("out of memory");
+        let size = size as usize;
+        if size < CACHE_SIZE {
+            if let Some(ix) = self.free[size].pop() {
+                assert_eq!(self.mems[ix].len(), size);
+                self.mems[ix].fill(0);
+                return ix as u32;
+            }
+        }
+        let ix = self.free_id;
+        self.free_id += 1;
         self.mems[ix] = self.allocator.alloc(size as usize);
         ix as u32
     }
 
-    #[inline(never)]
     fn free(&mut self, ix: u32) {
         let ix = ix as usize;
+        let size = self.mems[ix].len();
+        if size < CACHE_SIZE {
+            self.free[size].push(ix);
+            return;
+        }
         let freed = std::mem::replace(&mut self.mems[ix], Block::default());
         self.allocator.free(freed);
-        self.free.push(ix);
     }
 
     fn can_compile(&self, pc: usize) -> bool {

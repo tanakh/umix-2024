@@ -259,7 +259,18 @@ impl Machine {
                 12 => {
                     let idx = self.regs[b as usize] as usize;
                     if idx != 0 {
-                        log::info!("*** LONGJMP to block: {} ***", self.mems[idx].id);
+                        log::info!(
+                            "*** LONGJMP to block: {}:{} ***",
+                            self.mems[idx].id,
+                            self.regs[c as usize]
+                        );
+                        log::info!("*** Assembly dump:");
+                        if log_enabled!(Level::Info) {
+                            let code = crate::disasm::disasm(0, &self.mems[idx].mem).unwrap();
+                            for instr in code {
+                                log::info!("{}", instr);
+                            }
+                        }
 
                         let mut progn = self.mems[idx].clone();
                         let mut counter = self
