@@ -4,6 +4,7 @@ use std::{
     io::{self, Read as _, Write as _},
 };
 
+use codegen::ir::SigRef;
 use cranelift::prelude::*;
 use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::{Linkage, Module};
@@ -266,20 +267,18 @@ impl JIT {
             log::info!("");
         }
 
-        self.code_gen(pc, code);
+        let mut compiler = Compiler::new(self, code);
+        compiler.codegen(pc, code);
+        compiler.builder.finalize();
 
         if log_enabled!(Level::Info) {
             self.ctx.set_disasm(true);
         }
 
-        // let id = self
-        //     .module
-        //     .declare_anonymous_function(&self.ctx.func.signature)?;
-
         self.ctx.func.signature.call_conv = isa::CallConv::Tail;
 
         let id = self.module.declare_function(
-            &format!("{pc:08x}_{:08x}", pc as usize + code.len() - 1),
+            &format!("{pc:08x}_{:08x}_{hash:016x}", pc as usize + code.len() - 1),
             Linkage::Local,
             &self.ctx.func.signature,
         )?;
@@ -301,13 +300,62 @@ impl JIT {
 
         Ok(self.module.get_finalized_function(id))
     }
+}
 
-    fn code_gen(&mut self, pc: u32, code: &[u32]) {
+struct Compiler<'a> {
+    anal: Analysis,
+
+    module: &'a mut JITModule,
+    builder: FunctionBuilder<'a>,
+
+    param_machine: Value,
+    param_regs: Value,
+    param_mems: Value,
+    param_cb: Value,
+    param_jitted: Value,
+
+    putc_sig: Option<SigRef>,
+    getc_sig: Option<SigRef>,
+    alloc_sig: Option<SigRef>,
+    free_sig: Option<SigRef>,
+    cont_sig: SigRef,
+
+    putc_fp: Option<Value>,
+    getc_fp: Option<Value>,
+    alloc_fp: Option<Value>,
+    free_fp: Option<Value>,
+}
+
+#[derive(Clone, Copy)]
+enum Reg {
+    Value(Value),
+    Const(u32),
+}
+
+impl Reg {
+    fn value(&self, builder: &mut FunctionBuilder, cache: &mut HashMap<u32, Value>) -> Value {
+        match self {
+            Reg::Value(v) => *v,
+            Reg::Const(val) => {
+                if let Some(v) = cache.get(val) {
+                    *v
+                } else {
+                    let v = builder.ins().iconst(types::I32, *val as i64);
+                    cache.insert(*val, v);
+                    v
+                }
+            }
+        }
+    }
+}
+
+impl<'a> Compiler<'a> {
+    fn new(jit: &'a mut JIT, code: &[u32]) -> Self {
         let anal = Analysis::new(code);
 
-        let pt = self.module.target_config().pointer_type();
+        let pt = jit.module.target_config().pointer_type();
 
-        let params = &mut self.ctx.func.signature.params;
+        let params = &mut jit.ctx.func.signature.params;
 
         // machine
         params.push(AbiParam::new(pt));
@@ -320,13 +368,13 @@ impl JIT {
         // jitted
         params.push(AbiParam::new(pt));
 
-        self.ctx
+        jit.ctx
             .func
             .signature
             .returns
             .push(AbiParam::new(types::I32));
 
-        let mut builder = FunctionBuilder::new(&mut self.ctx.func, &mut self.builder_ctx);
+        let mut builder = FunctionBuilder::new(&mut jit.ctx.func, &mut jit.builder_ctx);
 
         let entry_block = builder.create_block();
 
@@ -339,8 +387,6 @@ impl JIT {
         let param_mems = builder.block_params(entry_block)[2];
         let param_cb = builder.block_params(entry_block)[3];
         let param_jitted = builder.block_params(entry_block)[4];
-
-        let mf = MemFlags::new();
 
         let putc_sig = if anal.call_putc {
             Some(builder.import_signature(Signature {
@@ -391,78 +437,88 @@ impl JIT {
             call_conv: isa::CallConv::Tail,
         });
 
-        let pt_size = self.module.target_config().pointer_bytes() as i32;
+        let pt_size = jit.module.target_config().pointer_bytes() as i32;
 
-        let fp_putc = if anal.call_putc {
-            Some(builder.ins().load(pt, mf, param_cb, 0))
+        let putc_fp = if anal.call_putc {
+            Some(builder.ins().load(pt, MemFlags::new(), param_cb, 0))
         } else {
             None
         };
-        let fp_getc = if anal.call_getc {
-            Some(builder.ins().load(pt, mf, param_cb, pt_size))
+        let getc_fp = if anal.call_getc {
+            Some(builder.ins().load(pt, MemFlags::new(), param_cb, pt_size))
         } else {
             None
         };
-        let fp_alloc = if anal.call_alloc {
-            Some(builder.ins().load(pt, mf, param_cb, pt_size * 2))
+        let alloc_fp = if anal.call_alloc {
+            Some(
+                builder
+                    .ins()
+                    .load(pt, MemFlags::new(), param_cb, pt_size * 2),
+            )
         } else {
             None
         };
-        let fp_free = if anal.call_free {
-            Some(builder.ins().load(pt, mf, param_cb, pt_size * 3))
+        let free_fp = if anal.call_free {
+            Some(
+                builder
+                    .ins()
+                    .load(pt, MemFlags::new(), param_cb, pt_size * 3),
+            )
         } else {
             None
         };
 
-        let mut finished = false;
-
-        #[derive(Clone, Copy)]
-        enum Reg {
-            Value(Value),
-            Const(u32),
+        Self {
+            anal,
+            builder,
+            module: &mut jit.module,
+            param_machine,
+            param_regs,
+            param_mems,
+            param_cb,
+            param_jitted,
+            putc_sig,
+            getc_sig,
+            alloc_sig,
+            free_sig,
+            cont_sig,
+            putc_fp,
+            getc_fp,
+            alloc_fp,
+            free_fp,
         }
+    }
 
-        impl Reg {
-            fn value(
-                &self,
-                builder: &mut FunctionBuilder,
-                cache: &mut HashMap<u32, Value>,
-            ) -> Value {
-                match self {
-                    Reg::Value(v) => *v,
-                    Reg::Const(val) => {
-                        if let Some(v) = cache.get(val) {
-                            *v
-                        } else {
-                            let v = builder.ins().iconst(types::I32, *val as i64);
-                            cache.insert(*val, v);
-                            v
-                        }
-                    }
-                }
+    fn finalize(&mut self, regs: &[Reg], cache: &mut HashMap<u32, Value>) {
+        for i in 0..8 {
+            if self.anal.write_reg[i] {
+                let v = regs[i].value(&mut self.builder, cache);
+                self.builder
+                    .ins()
+                    .store(MemFlags::new(), v, self.param_regs, i as i32 * 4);
             }
         }
+    }
+
+    fn codegen(&mut self, pc: u32, code: &[u32]) {
+        let pt = self.module.isa().pointer_type();
+        let pt_size = self.module.isa().pointer_bytes();
+
+        let mut finished = false;
 
         let mut regs = [Reg::Const(0); 8];
         let mut ptr_cache = [None; 8];
         let mut const_cache = HashMap::<u32, Value>::new();
 
         for i in 0..8 {
-            if anal.read_reg[i] {
-                regs[i] = Reg::Value(builder.ins().load(types::I32, mf, param_regs, i as i32 * 4));
+            if self.anal.read_reg[i] {
+                regs[i] = Reg::Value(self.builder.ins().load(
+                    types::I32,
+                    MemFlags::new(),
+                    self.param_regs,
+                    i as i32 * 4,
+                ));
             }
-        }
-
-        macro_rules! finalize {
-            () => {
-                for i in 0..8 {
-                    if anal.write_reg[i] {
-                        let v = regs[i].value(&mut builder, &mut const_cache);
-                        builder.ins().store(mf, v, param_regs, i as i32 * 4);
-                    }
-                }
-                finished = true;
-            };
         }
 
         for (pc_ofs, opc) in code.iter().cloned().enumerate() {
@@ -477,9 +533,9 @@ impl JIT {
                 0 => {
                     let v = match regs[c] {
                         Reg::Value(rc) => {
-                            let ra = regs[a].value(&mut builder, &mut const_cache);
-                            let rb = regs[b].value(&mut builder, &mut const_cache);
-                            Reg::Value(builder.ins().select(rc, rb, ra))
+                            let ra = regs[a].value(&mut self.builder, &mut const_cache);
+                            let rb = regs[b].value(&mut self.builder, &mut const_cache);
+                            Reg::Value(self.builder.ins().select(rc, rb, ra))
                         }
                         Reg::Const(vc) => {
                             if vc != 0 {
@@ -498,22 +554,29 @@ impl JIT {
                     let mem = if let Some(mem) = ptr_cache[b] {
                         mem
                     } else {
-                        let rb = regs[b].value(&mut builder, &mut const_cache);
-                        let ix = builder.ins().ishl_imm(rb, 4);
-                        let ix = builder.ins().uextend(pt, ix);
-                        let addr = builder.ins().iadd(param_mems, ix);
-                        builder.ins().load(pt, mf, addr, 0)
+                        let rb = regs[b].value(&mut self.builder, &mut const_cache);
+                        let ix = self.builder.ins().ishl_imm(rb, 4);
+                        let ix = self.builder.ins().uextend(pt, ix);
+                        let addr = self.builder.ins().iadd(self.param_mems, ix);
+                        self.builder.ins().load(pt, MemFlags::new(), addr, 0)
                     };
                     ptr_cache[b] = Some(mem);
 
                     let v = match regs[c] {
                         Reg::Value(rc) => {
-                            let ix = builder.ins().ishl_imm(rc, 2);
-                            let ix = builder.ins().uextend(pt, ix);
-                            let addr = builder.ins().iadd(mem, ix);
-                            builder.ins().load(types::I32, mf, addr, 0)
+                            let ix = self.builder.ins().ishl_imm(rc, 2);
+                            let ix = self.builder.ins().uextend(pt, ix);
+                            let addr = self.builder.ins().iadd(mem, ix);
+                            self.builder
+                                .ins()
+                                .load(types::I32, MemFlags::new(), addr, 0)
                         }
-                        Reg::Const(cc) => builder.ins().load(types::I32, mf, mem, (cc as i32) * 4),
+                        Reg::Const(cc) => self.builder.ins().load(
+                            types::I32,
+                            MemFlags::new(),
+                            mem,
+                            (cc as i32) * 4,
+                        ),
                     };
 
                     regs[a] = Reg::Value(v);
@@ -524,37 +587,41 @@ impl JIT {
                     let mem = if let Some(mem) = ptr_cache[a] {
                         mem
                     } else {
-                        let ra = regs[a].value(&mut builder, &mut const_cache);
-                        let ix = builder.ins().ishl_imm(ra, 4);
-                        let ix = builder.ins().uextend(pt, ix);
-                        let addr = builder.ins().iadd(param_mems, ix);
-                        builder.ins().load(pt, mf, addr, 0)
+                        let ra = regs[a].value(&mut self.builder, &mut const_cache);
+                        let ix = self.builder.ins().ishl_imm(ra, 4);
+                        let ix = self.builder.ins().uextend(pt, ix);
+                        let addr = self.builder.ins().iadd(self.param_mems, ix);
+                        self.builder.ins().load(pt, MemFlags::new(), addr, 0)
                     };
                     ptr_cache[a] = Some(mem);
 
-                    let rc = regs[c].value(&mut builder, &mut const_cache);
+                    let rc = regs[c].value(&mut self.builder, &mut const_cache);
 
                     match regs[b] {
                         Reg::Value(rb) => {
-                            let ix = builder.ins().ishl_imm(rb, 2);
-                            let ix = builder.ins().uextend(pt, ix);
-                            let addr = builder.ins().iadd(mem, ix);
-                            builder.ins().store(mf, rc, addr, 0);
+                            let ix = self.builder.ins().ishl_imm(rb, 2);
+                            let ix = self.builder.ins().uextend(pt, ix);
+                            let addr = self.builder.ins().iadd(mem, ix);
+                            self.builder.ins().store(MemFlags::new(), rc, addr, 0);
                         }
                         Reg::Const(cb) => {
-                            builder.ins().store(mf, rc, mem, (cb as i32) * 4);
+                            self.builder
+                                .ins()
+                                .store(MemFlags::new(), rc, mem, (cb as i32) * 4);
                         }
                     };
                 }
                 // Addition
                 3 => {
                     regs[a] = match (regs[b], regs[c]) {
-                        (Reg::Value(vb), Reg::Value(vc)) => Reg::Value(builder.ins().iadd(vb, vc)),
+                        (Reg::Value(vb), Reg::Value(vc)) => {
+                            Reg::Value(self.builder.ins().iadd(vb, vc))
+                        }
                         (Reg::Value(vb), Reg::Const(cc)) => {
-                            Reg::Value(builder.ins().iadd_imm(vb, cc as i64))
+                            Reg::Value(self.builder.ins().iadd_imm(vb, cc as i64))
                         }
                         (Reg::Const(cb), Reg::Value(vc)) => {
-                            Reg::Value(builder.ins().iadd_imm(vc, cb as i64))
+                            Reg::Value(self.builder.ins().iadd_imm(vc, cb as i64))
                         }
                         (Reg::Const(cb), Reg::Const(cc)) => Reg::Const(cb.wrapping_add(cc)),
                     };
@@ -563,12 +630,14 @@ impl JIT {
                 // Multiplication
                 4 => {
                     regs[a] = match (regs[b], regs[c]) {
-                        (Reg::Value(vb), Reg::Value(vc)) => Reg::Value(builder.ins().imul(vb, vc)),
+                        (Reg::Value(vb), Reg::Value(vc)) => {
+                            Reg::Value(self.builder.ins().imul(vb, vc))
+                        }
                         (Reg::Value(vb), Reg::Const(cc)) => {
-                            Reg::Value(builder.ins().imul_imm(vb, cc as i64))
+                            Reg::Value(self.builder.ins().imul_imm(vb, cc as i64))
                         }
                         (Reg::Const(cb), Reg::Value(vc)) => {
-                            Reg::Value(builder.ins().imul_imm(vc, cb as i64))
+                            Reg::Value(self.builder.ins().imul_imm(vc, cb as i64))
                         }
                         (Reg::Const(cb), Reg::Const(cc)) => Reg::Const(cb.wrapping_mul(cc)),
                     };
@@ -577,12 +646,14 @@ impl JIT {
                 // Division
                 5 => {
                     regs[a] = match (regs[b], regs[c]) {
-                        (Reg::Value(vb), Reg::Value(vc)) => Reg::Value(builder.ins().udiv(vb, vc)),
+                        (Reg::Value(vb), Reg::Value(vc)) => {
+                            Reg::Value(self.builder.ins().udiv(vb, vc))
+                        }
                         (Reg::Value(vb), Reg::Const(cc)) => {
-                            Reg::Value(builder.ins().udiv_imm(vb, cc as i64))
+                            Reg::Value(self.builder.ins().udiv_imm(vb, cc as i64))
                         }
                         (Reg::Const(cb), Reg::Value(vc)) => {
-                            Reg::Value(builder.ins().udiv_imm(vc, cb as i64))
+                            Reg::Value(self.builder.ins().udiv_imm(vc, cb as i64))
                         }
                         (Reg::Const(cb), Reg::Const(cc)) => Reg::Const(cb / cc),
                     };
@@ -593,13 +664,13 @@ impl JIT {
                     let v = if b != c {
                         match (regs[b], regs[c]) {
                             (Reg::Value(vb), Reg::Value(vc)) => {
-                                Reg::Value(builder.ins().band(vb, vc))
+                                Reg::Value(self.builder.ins().band(vb, vc))
                             }
                             (Reg::Value(vb), Reg::Const(cc)) => {
-                                Reg::Value(builder.ins().band_imm(vb, cc as i64))
+                                Reg::Value(self.builder.ins().band_imm(vb, cc as i64))
                             }
                             (Reg::Const(cb), Reg::Value(vc)) => {
-                                Reg::Value(builder.ins().band_imm(vc, cb as i64))
+                                Reg::Value(self.builder.ins().band_imm(vc, cb as i64))
                             }
                             (Reg::Const(cb), Reg::Const(cc)) => Reg::Const(cb & cc),
                         }
@@ -607,104 +678,111 @@ impl JIT {
                         regs[b]
                     };
                     regs[a] = match v {
-                        Reg::Value(v) => Reg::Value(builder.ins().bnot(v)),
+                        Reg::Value(v) => Reg::Value(self.builder.ins().bnot(v)),
                         Reg::Const(val) => Reg::Const(!val),
                     };
                     ptr_cache[a] = None;
                 }
                 // halt
                 7 => {
-                    finalize!();
-                    let ret = builder.ins().iconst(types::I32, !0);
-                    builder.ins().return_(&[ret]);
+                    self.finalize(&regs, &mut const_cache);
+                    finished = true;
+                    let ret = self.builder.ins().iconst(types::I32, !0);
+                    self.builder.ins().return_(&[ret]);
                 }
                 // Allocation
                 8 => {
-                    let rc = regs[c].value(&mut builder, &mut const_cache);
-                    let ret = builder.ins().call_indirect(
-                        alloc_sig.unwrap(),
-                        fp_alloc.unwrap(),
-                        &[param_machine, rc],
+                    let rc = regs[c].value(&mut self.builder, &mut const_cache);
+                    let ret = self.builder.ins().call_indirect(
+                        self.alloc_sig.unwrap(),
+                        self.alloc_fp.unwrap(),
+                        &[self.param_machine, rc],
                     );
-                    regs[b] = Reg::Value(builder.inst_results(ret)[0]);
+                    regs[b] = Reg::Value(self.builder.inst_results(ret)[0]);
                     ptr_cache.fill(None);
                 }
                 // Abandonment
                 9 => {
-                    let rc = regs[c].value(&mut builder, &mut const_cache);
-                    builder.ins().call_indirect(
-                        free_sig.unwrap(),
-                        fp_free.unwrap(),
-                        &[param_machine, rc],
+                    let rc = regs[c].value(&mut self.builder, &mut const_cache);
+                    self.builder.ins().call_indirect(
+                        self.free_sig.unwrap(),
+                        self.free_fp.unwrap(),
+                        &[self.param_machine, rc],
                     );
                 }
                 // Output
                 10 => {
-                    let vc = regs[c].value(&mut builder, &mut const_cache);
-                    builder
-                        .ins()
-                        .call_indirect(putc_sig.unwrap(), fp_putc.unwrap(), &[vc]);
+                    let vc = regs[c].value(&mut self.builder, &mut const_cache);
+                    self.builder.ins().call_indirect(
+                        self.putc_sig.unwrap(),
+                        self.putc_fp.unwrap(),
+                        &[vc],
+                    );
                 }
                 // Input
                 11 => {
-                    let ret = builder
-                        .ins()
-                        .call_indirect(getc_sig.unwrap(), fp_getc.unwrap(), &[]);
-                    regs[c] = Reg::Value(builder.inst_results(ret)[0]);
+                    let ret = self.builder.ins().call_indirect(
+                        self.getc_sig.unwrap(),
+                        self.getc_fp.unwrap(),
+                        &[],
+                    );
+                    regs[c] = Reg::Value(self.builder.inst_results(ret)[0]);
                     ptr_cache[c] = None;
                 }
                 // Load Program
                 12 => {
-                    finalize!();
+                    self.finalize(&regs, &mut const_cache);
+                    finished = true;
 
                     // if B == 0 then return C, otherwise return address of this instruction
-                    let cur_pc = builder
+                    let cur_pc = self
+                        .builder
                         .ins()
                         .iconst(types::I32, (pc + pc_ofs as u32) as i64);
 
-                    let rb = regs[b].value(&mut builder, &mut const_cache);
-                    let rc = regs[c].value(&mut builder, &mut const_cache);
+                    let rb = regs[b].value(&mut self.builder, &mut const_cache);
+                    let rc = regs[c].value(&mut self.builder, &mut const_cache);
 
-                    let ret_addr = builder.ins().select(rb, cur_pc, rc);
+                    let ret_addr = self.builder.ins().select(rb, cur_pc, rc);
 
-                    let offset = builder.ins().uextend(pt, ret_addr);
-                    let pt_size = builder.ins().iconst(types::I64, pt_size as i64);
-                    let offset = builder.ins().imul(offset, pt_size);
-                    let cont_addr = builder.ins().iadd(param_jitted, offset);
-                    let cont = builder.ins().load(pt, mf, cont_addr, 0);
+                    let offset = self.builder.ins().uextend(pt, ret_addr);
+                    let pt_size = self.builder.ins().iconst(types::I64, pt_size as i64);
+                    let offset = self.builder.ins().imul(offset, pt_size);
+                    let cont_addr = self.builder.ins().iadd(self.param_jitted, offset);
+                    let cont = self.builder.ins().load(pt, MemFlags::new(), cont_addr, 0);
 
-                    let call_jit = builder.create_block();
+                    let call_jit = self.builder.create_block();
+                    self.builder.append_block_param(call_jit, pt);
+                    let ret_pc = self.builder.create_block();
+                    self.builder.append_block_param(ret_pc, types::I32);
+
+                    self.builder
+                        .ins()
+                        .brif(cont, call_jit, &[cont], ret_pc, &[ret_addr]);
+
+                    self.builder.seal_block(call_jit);
+                    self.builder.seal_block(ret_pc);
+
                     {
-                        builder.append_block_param(call_jit, pt);
-                        builder.switch_to_block(call_jit);
-                        let param_cont = builder.block_params(call_jit)[0];
-                        builder.ins().return_call_indirect(
-                            cont_sig,
+                        self.builder.switch_to_block(call_jit);
+                        let param_cont = self.builder.block_params(call_jit)[0];
+                        self.builder.ins().return_call_indirect(
+                            self.cont_sig,
                             param_cont,
                             &[
-                                param_machine,
-                                param_regs,
-                                param_mems,
-                                param_cb,
-                                param_jitted,
+                                self.param_machine,
+                                self.param_regs,
+                                self.param_mems,
+                                self.param_cb,
+                                self.param_jitted,
                             ],
                         );
                     }
 
-                    let ret_pc = builder.create_block();
                     {
-                        builder.append_block_param(ret_pc, types::I32);
-                        builder.switch_to_block(ret_pc);
-                        builder.ins().return_(&[ret_addr]);
+                        self.builder.switch_to_block(ret_pc);
+                        self.builder.ins().return_(&[ret_addr]);
                     }
-
-                    builder.switch_to_block(entry_block);
-                    builder
-                        .ins()
-                        .brif(cont, call_jit, &[cont], ret_pc, &[ret_addr]);
-
-                    builder.seal_block(call_jit);
-                    builder.seal_block(ret_pc);
                 }
                 // Orthography
                 13 => {
@@ -719,8 +797,6 @@ impl JIT {
         }
 
         assert!(finished);
-
-        builder.finalize();
     }
 }
 
@@ -937,7 +1013,8 @@ impl Machine {
         let size = size as usize;
         if size < CACHE_SIZE {
             if let Some(ix) = self.free[size].pop() {
-                assert_eq!(self.mems[ix].len(), size);
+                // assert_eq!(self.mems[ix].len(), size);
+                // self.mems[ix].iter_mut().for_each(|w| *w = 0);
                 self.mems[ix].fill(0);
                 return ix as u32;
             }
